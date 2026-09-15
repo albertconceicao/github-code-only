@@ -34,6 +34,36 @@ test("does not treat contest or latest as tests", () => {
   assert.equal(reasons("latest/index.js").includes("tests"), false);
 });
 
+test("does not flag names that merely contain test or spec", () => {
+  assert.equal(reasons("src/latest_version.py").includes("tests"), false);
+  assert.equal(reasons("src/contest_results.ts").includes("tests"), false);
+  assert.equal(reasons("pkg/attest.go").includes("tests"), false);
+  assert.equal(reasons("src/inspect_state.rb").includes("tests"), false);
+});
+
+test("Java and Kotlin suffixes are case-sensitive", () => {
+  assert.ok(reasons("src/main/java/UserServiceIT.java").includes("tests"));
+  assert.ok(reasons("src/test/java/UserTest.java").includes("tests"));
+  assert.ok(reasons("src/UserSpec.kt").includes("tests"));
+  assert.equal(reasons("src/main/java/Commit.java").includes("tests"), false);
+  assert.equal(reasons("src/main/java/Audit.java").includes("tests"), false);
+  assert.equal(reasons("src/Edit.kt").includes("tests"), false);
+});
+
+test("detects bounded test tokens and framework suffixes", () => {
+  assert.ok(reasons("src/checkout.e2e.ts").includes("tests"));
+  assert.ok(reasons("src/Button.cy.tsx").includes("tests"));
+  assert.ok(reasons("src/app.e2e-spec.ts").includes("tests"));
+  assert.ok(reasons("src/test-utils.ts").includes("tests"));
+  assert.ok(reasons("src/user.test.helper.ts").includes("tests"));
+  assert.ok(reasons("lib/spec_helper.rb").includes("tests"));
+});
+
+test("spec documents named *.spec.md are specs, not tests", () => {
+  assert.deepEqual(reasons("docs/api.spec.md"), ["specs"]);
+  assert.deepEqual(reasons("docs/api.spec.yaml"), ["specs"]);
+});
+
 test("detects ADRs", () => {
   assert.ok(reasons("docs/adr/0001-use-postgres.md").includes("adrs"));
   assert.ok(reasons("adr/0002-auth.md").includes("adrs"));
@@ -59,6 +89,10 @@ test("detects AI-generated and agent files", () => {
   assert.ok(reasons("pkg/proto/user.pb.go").includes("ai"));
   assert.ok(reasons("__generated__/graphql.ts").includes("ai"));
   assert.equal(reasons(".github/workflows/ci.yml").includes("ai"), false);
+  assert.ok(reasons(".github/instructions/react.instructions.md").includes("ai"));
+  assert.ok(reasons(".github/prompts/refactor.prompt.md").includes("ai"));
+  assert.equal(reasons(".github/CODEOWNERS").includes("ai"), false);
+  assert.equal(reasons(".github/ISSUE_TEMPLATE/bug.md").includes("ai"), false);
 });
 
 test("hides only categories that are enabled", () => {
@@ -72,6 +106,14 @@ test("supports custom globs and regex", () => {
   assert.equal(shouldHide("vendor/lodash/index.js", settings), "custom");
   assert.equal(shouldHide("yarn.lock", settings), "custom");
   assert.equal(shouldHide("src/app.ts", settings), null);
+});
+
+test("cached custom regex stays stable across calls, even with a g flag", () => {
+  const settings = { custom: ["/yarn\\.lock$/g"] };
+  assert.equal(shouldHide("a/yarn.lock", settings), "custom");
+  assert.equal(shouldHide("b/yarn.lock", settings), "custom");
+  assert.equal(shouldHide("c/yarn.lock", settings), "custom");
+  assert.equal(shouldHide("src/app.ts", { custom: ["/(unclosed/"] }), null);
 });
 
 test("exclusive filename text does not leak to a sibling source file", () => {

@@ -1,16 +1,15 @@
+/* Opacity only: a filter would promote every dimmed diff to its own compositing layer and
+   repaint the whole card on hover. */
 .gco-dimmed {
   opacity: 0.38 !important;
-  filter: grayscale(0.2);
   transition: opacity 0.15s ease;
 }
 
 .gco-dimmed:hover {
   opacity: 0.78 !important;
-  filter: none;
 }
 
 .gco-focus:not(.gco-dimmed) {
-  filter: none;
   text-decoration: none;
 }
 

@@ -78,6 +78,7 @@ const SPEC_DIRS = new Set([
   "prds",
 ]);
 
+// `.github` is handled separately: only its Copilot sub-folders count as AI files.
 const AI_DIRS = new Set([
   ".cursor",
   ".windsurf",
@@ -90,7 +91,6 @@ const AI_DIRS = new Set([
   ".ai",
   ".specify",
   ".kiro",
-  ".github",
   "prompts",
   "__generated__",
   "generated",
@@ -107,6 +107,14 @@ const AI_ROOT_FILES = new Set([
   "copilot-instructions.md",
   "walkthrough.md",
 ]);
+
+// A test token must be bounded by the start/end of the stem or by `.`, `_`, `-`, so that
+// `user_test.go`, `test_parser.py`, `spec_helper.rb`, `app.e2e-spec.ts` and `Button.cy.tsx` match
+// while `latest_version.py`, `contest_results.ts` and `attest.go` do not.
+const TEST_TOKEN = /(^|[._-])(test|tests|spec|e2e|cy)([._-]|$)/;
+
+// Java/Kotlin suffix conventions are case-sensitive so `Commit.java` and `Audit.kt` are not `IT` tests.
+const JVM_TEST_SUFFIX = /(Test|Tests|IT|Spec)\.(java|kt|kts)$/;
 
 function normalizePath(filePath) {
   return String(filePath || "")
@@ -152,36 +160,38 @@ function segments(filePath) {
     .map((part) => part.toLowerCase());
 }
 
+// Parsed once per path; every classifier reads from this instead of re-splitting the string.
+function parse(filePath) {
+  const path = normalizePath(filePath);
+  const name = basename(path);
+  return { path, name, lower: name.toLowerCase(), parts: segments(path), ext: extname(name) };
+}
+
 function hasDir(parts, names) {
   return parts.some((part) => names.has(part));
 }
 
-function isCodeExt(ext) {
-  return CODE_EXTS.has(ext);
-}
-
 function isTestFilename(name) {
   const lower = name.toLowerCase();
-  if (/\.(test|spec|tests)\.[^.]+$/i.test(lower)) return true;
-  if (/\.(test|spec)\./i.test(lower) && isCodeExt(extname(lower))) return true;
-  if (/(_test|_spec|test_|spec_)/i.test(lower) && isCodeExt(extname(lower))) return true;
-  if (/^test_.+\.py$/.test(lower) || /_test\.py$/.test(lower)) return true;
-  if (/_test\.go$/.test(lower)) return true;
-  if (/.+(test|tests|it|spec)\.(java|kt|kts)$/.test(lower)) return true;
+  const ext = extname(lower);
+  if (/\.(test|tests)\.[^.]+$/.test(lower)) return true;
+  // `api.spec.md` / `api.spec.yaml` are spec documents, not tests.
+  if (/\.spec\.[^.]+$/.test(lower) && !SPEC_DOC_EXTS.has(ext)) return true;
   if (/\.(snap|feature)$/.test(lower)) return true;
-  return false;
+  if (JVM_TEST_SUFFIX.test(name)) return true;
+  if (!CODE_EXTS.has(ext)) return false;
+  const stem = ext ? lower.slice(0, -(ext.length + 1)) : lower;
+  return TEST_TOKEN.test(stem);
 }
 
-function isAdrFilename(name) {
-  const lower = name.toLowerCase();
+function isAdrFilename(lower) {
   if (/^adr[-_.]/.test(lower)) return true;
   if (/[-_.]adr[-_.]/.test(lower)) return true;
   if (/^adr\.(md|mdx|txt)$/.test(lower)) return true;
   return false;
 }
 
-function isSpecFilename(name) {
-  const lower = name.toLowerCase();
+function isSpecFilename(lower) {
   if (/^(spec|specs|specification|prd)\.(md|mdx|txt|adoc|yml|yaml|json)$/.test(lower)) {
     return true;
   }
@@ -190,95 +200,81 @@ function isSpecFilename(name) {
   return false;
 }
 
-function isAiFilename(name, parts) {
-  const lower = name.toLowerCase();
+function isAiFilename(lower, parts) {
   if (AI_ROOT_FILES.has(lower)) return true;
   if (lower.endsWith(".mdc")) return true;
-  if (/\.generated\./i.test(lower) || /\.gen\.(ts|tsx|js|go|java)$/i.test(lower)) return true;
+  if (/\.generated\./.test(lower) || /\.gen\.(ts|tsx|js|go|java)$/.test(lower)) return true;
   if (/\.pb\.(go|ts|js)$/.test(lower) || /_pb2\.py$/.test(lower)) return true;
   if (lower === "skill.md" && parts.some((part) => part === "skills" || part === ".cursor" || part === ".agents")) {
     return true;
   }
-  if (parts.includes(".github") && (lower === "copilot-instructions.md" || parts.includes("instructions") || parts.includes("copilot"))) {
-    return true;
-  }
   return false;
+}
+
+// Inside `.github/` only Copilot's own folders are AI files; workflows, templates and CODEOWNERS are not.
+function isGithubAiPath(lower, parts) {
+  return (
+    parts.includes("instructions") ||
+    parts.includes("copilot") ||
+    parts.includes("prompts") ||
+    parts.includes("agents") ||
+    lower === "copilot-instructions.md" ||
+    lower === "agents.md"
+  );
+}
+
+function testPath({ name, parts, ext }) {
+  if (isTestFilename(name)) return true;
+  if (hasDir(parts, TEST_DIRS)) return true;
+  return hasDir(parts, TEST_SPEC_DIRS) && (CODE_EXTS.has(ext) || ext === "feature" || ext === "snap");
+}
+
+function adrPath({ lower, parts, ext }) {
+  if (isAdrFilename(lower)) return true;
+  if (hasDir(parts, ADR_DIRS)) return true;
+  return parts.includes("decisions") && DOC_EXTS.has(ext);
+}
+
+function specPath({ lower, parts, ext }, isTest) {
+  if (isTest && CODE_EXTS.has(ext)) return false;
+  if (isSpecFilename(lower)) return true;
+  if (hasDir(parts, SPEC_DIRS) && SPEC_DOC_EXTS.has(ext)) return true;
+  if (parts.includes(".kiro") && parts.includes("specs")) return true;
+  return parts.includes("docs") && (parts.includes("spec") || parts.includes("specs") || parts.includes("prd"));
+}
+
+function aiPath({ lower, parts }) {
+  if (isAiFilename(lower, parts)) return true;
+  if (parts.includes(".github")) return isGithubAiPath(lower, parts);
+  if (hasDir(parts, AI_DIRS)) return true;
+  return parts.includes("plans") && (parts.includes(".cursor") || parts.includes("docs") || parts.includes(".agents"));
 }
 
 function isTestPath(filePath) {
-  const path = normalizePath(filePath);
-  const name = basename(path);
-  const parts = segments(path);
-  const ext = extname(path);
-
-  if (isTestFilename(name)) return true;
-  if (hasDir(parts, TEST_DIRS)) return true;
-
-  if (hasDir(parts, TEST_SPEC_DIRS) && (isCodeExt(ext) || ext === "feature" || ext === "snap")) {
-    return true;
-  }
-
-  return false;
+  return testPath(parse(filePath));
 }
 
 function isAdrPath(filePath) {
-  const path = normalizePath(filePath);
-  const name = basename(path);
-  const parts = segments(path);
-
-  if (isAdrFilename(name)) return true;
-  if (hasDir(parts, ADR_DIRS)) return true;
-  if (parts.includes("decisions") && DOC_EXTS.has(extname(path))) return true;
-  return false;
+  return adrPath(parse(filePath));
 }
 
 function isSpecPath(filePath) {
-  const path = normalizePath(filePath);
-  const name = basename(path);
-  const parts = segments(path);
-  const ext = extname(path);
-
-  if (isTestPath(path) && isCodeExt(ext)) return false;
-  if (isSpecFilename(name)) return true;
-
-  if (hasDir(parts, SPEC_DIRS) && SPEC_DOC_EXTS.has(ext)) return true;
-  if (parts.includes(".kiro") && parts.includes("specs")) return true;
-  if (parts.includes("docs") && (parts.includes("spec") || parts.includes("specs") || parts.includes("prd"))) {
-    return true;
-  }
-
-  return false;
+  const info = parse(filePath);
+  return specPath(info, testPath(info));
 }
 
 function isAiPath(filePath) {
-  const path = normalizePath(filePath);
-  const name = basename(path);
-  const parts = segments(path);
-
-  if (isAiFilename(name, parts)) return true;
-  if (parts.some((part) => AI_DIRS.has(part))) {
-    if (parts.includes(".github")) {
-      return (
-        parts.includes("instructions") ||
-        parts.includes("copilot") ||
-        name.toLowerCase() === "copilot-instructions.md" ||
-        name.toLowerCase() === "agents.md"
-      );
-    }
-    return true;
-  }
-  if (parts.includes("plans") && (parts.includes(".cursor") || parts.includes("docs") || parts.includes(".agents"))) {
-    return true;
-  }
-  return false;
+  return aiPath(parse(filePath));
 }
 
 function classify(filePath) {
+  const info = parse(filePath);
+  const tests = testPath(info);
   return {
-    tests: isTestPath(filePath),
-    adrs: isAdrPath(filePath),
-    specs: isSpecPath(filePath),
-    ai: isAiPath(filePath),
+    tests,
+    adrs: adrPath(info),
+    specs: specPath(info, tests),
+    ai: aiPath(info),
   };
 }
 
@@ -313,28 +309,47 @@ function globToRegExp(pattern) {
   return new RegExp(regex, "i");
 }
 
-function matchesCustom(filePath, patterns) {
-  const path = normalizePath(filePath);
-  if (!patterns || patterns.length === 0) return false;
+// Compiled patterns are reused across every file on the page. The cache is keyed by the raw pattern
+// text and bounded because patterns are user input.
+const CUSTOM_CACHE_LIMIT = 256;
+const customPatternCache = new Map();
 
-  return patterns.some((raw) => {
-    const pattern = String(raw || "").trim();
-    if (!pattern) return false;
-    if (pattern.startsWith("/") && pattern.lastIndexOf("/") > 0) {
-      const last = pattern.lastIndexOf("/");
-      const body = pattern.slice(1, last);
-      const flags = pattern.slice(last + 1) || "i";
-      try {
-        return new RegExp(body, flags).test(path);
-      } catch {
-        return false;
-      }
-    }
+function buildCustomMatcher(pattern) {
+  const last = pattern.lastIndexOf("/");
+  if (pattern.startsWith("/") && last > 0) {
+    // `g` and `y` make RegExp.test stateful, which would break a cached instance.
+    const flags = (pattern.slice(last + 1) || "i").replace(/[gy]/g, "");
     try {
-      return globToRegExp(pattern).test(path);
+      return new RegExp(pattern.slice(1, last), flags);
     } catch {
-      return path.toLowerCase().includes(pattern.toLowerCase());
+      return null;
     }
+  }
+  try {
+    return globToRegExp(pattern);
+  } catch {
+    const needle = pattern.toLowerCase();
+    return { test: (path) => path.toLowerCase().includes(needle) };
+  }
+}
+
+function compileCustom(raw) {
+  const pattern = String(raw || "").trim();
+  if (!pattern) return null;
+  let matcher = customPatternCache.get(pattern);
+  if (matcher !== undefined) return matcher;
+  matcher = buildCustomMatcher(pattern);
+  if (customPatternCache.size >= CUSTOM_CACHE_LIMIT) customPatternCache.clear();
+  customPatternCache.set(pattern, matcher);
+  return matcher;
+}
+
+function matchesCustom(filePath, patterns) {
+  if (!Array.isArray(patterns) || patterns.length === 0) return false;
+  const path = normalizePath(filePath);
+  return patterns.some((raw) => {
+    const matcher = compileCustom(raw);
+    return matcher ? matcher.test(path) : false;
   });
 }
 
@@ -349,14 +364,18 @@ function isReviewPage(pathname = "") {
   );
 }
 
+// Only the classifiers whose filter is enabled run, in priority order.
 function shouldHide(filePath, settings) {
-  const flags = classify(filePath);
-  if (settings?.tests && flags.tests) return "tests";
-  if (settings?.adrs && flags.adrs) return "adrs";
-  if (settings?.specs && flags.specs) return "specs";
-  if (settings?.ai && flags.ai) return "ai";
-  if (matchesCustom(filePath, settings?.custom)) return "custom";
-  return null;
+  const options = settings || {};
+  const info = parse(filePath);
+  if (options.tests || options.adrs || options.specs || options.ai) {
+    const tests = testPath(info);
+    if (options.tests && tests) return "tests";
+    if (options.adrs && adrPath(info)) return "adrs";
+    if (options.specs && specPath(info, tests)) return "specs";
+    if (options.ai && aiPath(info)) return "ai";
+  }
+  return matchesCustom(info.path, options.custom) ? "custom" : null;
 }
 
 const GitHubCodeOnly = {

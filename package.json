@@ -1,6 +1,6 @@
 {
   "name": "github-code-only",
-  "version": "1.0.0",
+  "version": "1.0.8",
   "private": true,
   "description": "Dim tests, ADRs, specs, and AI files on GitHub PR review",
   "scripts": {

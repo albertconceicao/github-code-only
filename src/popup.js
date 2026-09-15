@@ -7,10 +7,13 @@ const DEFAULT_SETTINGS = {
   autoCollapse: true,
   custom: [],
 };
+// Typing in the patterns box saves after a short pause so an edit is not lost when the popup closes.
+const SAVE_DEBOUNCE_MS = 400;
 
 const storage = typeof browser !== "undefined" ? browser.storage : chrome.storage;
 
 const settings = { ...DEFAULT_SETTINGS };
+let saveTimer = 0;
 
 function parseCustom(text) {
   return text
@@ -19,28 +22,44 @@ function parseCustom(text) {
     .filter(Boolean);
 }
 
-async function persist() {
-  await storage.sync.set({ [STORAGE_KEY]: settings });
+function persist() {
+  window.clearTimeout(saveTimer);
+  return storage.sync.set({ [STORAGE_KEY]: settings }).catch((error) => {
+    console.warn("GitHub Code Only: could not save settings", error);
+  });
+}
+
+function schedulePersist() {
+  window.clearTimeout(saveTimer);
+  saveTimer = window.setTimeout(persist, SAVE_DEBOUNCE_MS);
 }
 
 async function init() {
-  const stored = await storage.sync.get(STORAGE_KEY);
-  Object.assign(settings, DEFAULT_SETTINGS, stored?.[STORAGE_KEY] || {});
+  try {
+    const stored = await storage.sync.get(STORAGE_KEY);
+    Object.assign(settings, stored?.[STORAGE_KEY] || {});
+  } catch (error) {
+    console.warn("GitHub Code Only: could not load settings", error);
+  }
   if (!Array.isArray(settings.custom)) settings.custom = [];
 
   for (const input of document.querySelectorAll("input[data-key]")) {
     input.checked = Boolean(settings[input.dataset.key]);
-    input.addEventListener("change", async () => {
+    input.addEventListener("change", () => {
       settings[input.dataset.key] = input.checked;
-      await persist();
+      persist();
     });
   }
 
   const custom = document.getElementById("custom");
   custom.value = settings.custom.join("\n");
-  custom.addEventListener("change", async () => {
+  custom.addEventListener("input", () => {
     settings.custom = parseCustom(custom.value);
-    await persist();
+    schedulePersist();
+  });
+  custom.addEventListener("change", () => {
+    settings.custom = parseCustom(custom.value);
+    persist();
   });
 }
 

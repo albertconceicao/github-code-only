@@ -3,9 +3,15 @@ const { shouldHide, normalizePath, basename, fileNameTokens, textMatchesExclusiv
   globalThis.GitHubCodeOnly;
 
 const STORAGE_KEY = "gco-settings";
+const BAR_ID = "gco-bar";
 const DIMMED_CLASS = "gco-dimmed";
 const FOCUS_CLASS = "gco-focus";
 const STRIKE_CLASS = "gco-strike";
+const REASON_ATTR = "data-gco-reason";
+const APPLY_DEBOUNCE_MS = 60;
+// How long GitHub's own re-render after a collapse click is allowed to settle before we react to it.
+const COLLAPSE_SETTLE_MS = 250;
+
 const DEFAULT_SETTINGS = {
   tests: true,
   adrs: false,
@@ -22,34 +28,100 @@ const FILTERS = [
   { id: "ai", label: "AI", title: "Dim Cursor, Copilot, agent, and generated files" },
 ];
 
+const HEADER_SELECTOR =
+  ".file-header, [class*='DiffFileHeader-module__diff-file-header'], [class*='Diff-module__diffHeaderWrapper']";
+const FILE_TITLE_SELECTOR =
+  '[class*="DiffFileHeader-module__file-name"], [class*="DiffFileHeader-module__fileName"], .file-header a.Link--primary';
+const FILE_CARD_SELECTOR =
+  "div.file.js-file, copilot-diff-entry, [data-details-container-group='file'], details, .js-details-container";
+const DIFF_NODE_SELECTORS = [
+  "copilot-diff-entry[data-file-path]",
+  "div.file.js-file[data-tagsearch-path]",
+  "div.file-header[data-path]",
+  '[class*="DiffFileHeader-module__diff-file-header"]',
+  '[class*="DiffFileHeader-module__file-name"]',
+  '[class*="Diff-module__diffHeaderWrapper"]',
+];
+const TREE_ROW_SELECTOR = '[role="treeitem"], [data-tree-entry-type="file"]';
+const TREE_NODE_SELECTOR = '[role="treeitem"], [data-tree-entry-type="file"], [data-tree-entry-type="directory"]';
+const TREE_ITEM_SELECTOR = "[data-tree-entry-type='file'], [role='tree'] [role='treeitem'], [role='tree'] a[href]";
+const LABEL_SELECTOR = "a, span, [class*='file-name'], [class*='ItemLabel']";
+const OWN_TEXT_SKIP_SELECTOR =
+  '[role="treeitem"], [role="group"], [data-tree-entry-type], [class*="DiffFileHeader"], .file-header';
+const RELEVANT_SELECTOR =
+  "div.file, copilot-diff-entry, li.js-tree-node, .pr-toolbar, #files, [class*='Diff-module'], [class*='DiffFileHeader-module'], [role='treeitem']";
+
 const storage = typeof browser !== "undefined" ? browser.storage : chrome.storage;
 
 let settings = { ...DEFAULT_SETTINGS };
 let applyTimer = 0;
 let observer = null;
 let lastUrl = location.href;
+let collapseSettleTimer = 0;
 let syncingCollapse = false;
+let pendingApply = false;
+
+// Per-run caches. Every file walks up through the same ancestors, so without these the diff list
+// container gets re-queried once per file.
+let headerCache = new WeakMap();
+let titleCache = new WeakMap();
+let treeLabelCache = new WeakMap();
+let hideCache = new Map();
+
+// Elements currently carrying our classes. A re-run only touches what changed instead of
+// clearing and re-adding every class on every mutation.
+let marked = new Set();
+
+// Paths we already auto-collapsed on this page. A diff the user expands by hand stays expanded
+// until the filters change or the page changes.
+const autoCollapsed = new Set();
 
 function onReviewPage() {
   return isReviewPage(location.pathname);
 }
 
+function beginRun() {
+  headerCache = new WeakMap();
+  titleCache = new WeakMap();
+  treeLabelCache = new WeakMap();
+  hideCache = new Map();
+}
+
+function hideReason(path) {
+  let reason = hideCache.get(path);
+  if (reason === undefined) {
+    reason = shouldHide(path, settings);
+    hideCache.set(path, reason);
+  }
+  return reason;
+}
+
+function mergeSettings(value) {
+  const stored = value && typeof value === "object" ? value : {};
+  return {
+    ...DEFAULT_SETTINGS,
+    ...stored,
+    custom: Array.isArray(stored.custom) ? stored.custom : [],
+  };
+}
+
 async function loadSettings() {
   try {
     const stored = await storage.sync.get(STORAGE_KEY);
-    const value = stored?.[STORAGE_KEY] || {};
-    settings = {
-      ...DEFAULT_SETTINGS,
-      ...value,
-      custom: Array.isArray(value.custom) ? value.custom : DEFAULT_SETTINGS.custom,
-    };
+    settings = mergeSettings(stored?.[STORAGE_KEY]);
   } catch {
     settings = { ...DEFAULT_SETTINGS };
   }
 }
 
-async function saveSettings() {
-  await storage.sync.set({ [STORAGE_KEY]: settings });
+function saveSettings() {
+  return storage.sync.set({ [STORAGE_KEY]: settings }).catch((error) => {
+    console.warn("GitHub Code Only: could not save settings", error);
+  });
+}
+
+function isOurs(el) {
+  return Boolean(el?.closest?.(`#${BAR_ID}`));
 }
 
 function parseHydroPath(value) {
@@ -74,7 +146,7 @@ function pathFromElement(el) {
 }
 
 function looksLikePath(value) {
-  const text = normalizePath(value).replace(/\u200E/g, "");
+  const text = normalizePath(value).replace(/‎/g, "");
   if (!text || text.length > 400) return "";
   if (text.includes("://") || text.startsWith("#")) return "";
   if (!/[\w.-]+\.[A-Za-z0-9]{1,8}$/.test(text) && !text.includes("/")) return "";
@@ -83,11 +155,9 @@ function looksLikePath(value) {
 }
 
 function pathFromReactHeader(el) {
-  const nameEl = el.querySelector(
-    '[class*="DiffFileHeader-module__file-name"], [class*="file-name"]'
-  );
+  const nameEl = el.querySelector('[class*="DiffFileHeader-module__file-name"], [class*="file-name"]');
   const source = nameEl || el;
-  const text = (source.textContent || "").replace(/\u200E/g, " ").replace(/\s+/g, " ").trim();
+  const text = (source.textContent || "").replace(/‎/g, " ").replace(/\s+/g, " ").trim();
   if (!text) return "";
   const renamed = text.split(/\s*→\s*/);
   const candidate = renamed[renamed.length - 1] || text;
@@ -100,25 +170,49 @@ function isLayoutNode(el) {
   const id = el.id || "";
   if (id === "diff-layout-component" || id.startsWith("diff-layout") || id === "files") return true;
   const cls = String(el.className || "");
-  if (/diff-sidebar|Layout-sidebar|diff-view|DiffList|file-tree/i.test(cls)) return true;
-  return false;
+  return /diff-sidebar|Layout-sidebar|diff-view|DiffList|file-tree/i.test(cls);
 }
 
 function isHeaderRoot(el) {
   if (!el || el.nodeType !== 1) return false;
-  if (el.classList?.contains("file-header")) return true;
+  if (el.classList.contains("file-header")) return true;
   const cls = String(el.className || "");
   return /DiffFileHeader-module__diff-file-header|Diff-module__diffHeaderWrapper/i.test(cls);
 }
 
+// Keeps only nodes not contained by another node in the list. `nodes` must be in document order
+// (pre-order), which querySelectorAll guarantees: any kept ancestor of a node is then always the
+// most recently kept node, so a single `contains` check per node is enough.
+function outermost(nodes) {
+  const kept = [];
+  for (const node of nodes) {
+    const last = kept[kept.length - 1];
+    if (last && last.contains(node)) continue;
+    kept.push(node);
+  }
+  return kept;
+}
+
 function headerRoots(el) {
   if (!el || el.nodeType !== 1) return [];
-  const found = [];
-  if (isHeaderRoot(el)) found.push(el);
-  el.querySelectorAll(
-    ".file-header, [class*='DiffFileHeader-module__diff-file-header'], [class*='Diff-module__diffHeaderWrapper']"
-  ).forEach((node) => found.push(node));
-  return [...new Set(found)].filter((node) => !found.some((other) => other !== node && other.contains(node)));
+  let roots = headerCache.get(el);
+  if (!roots) {
+    const found = isHeaderRoot(el) ? [el] : [];
+    for (const node of el.querySelectorAll(HEADER_SELECTOR)) found.push(node);
+    roots = outermost(found);
+    headerCache.set(el, roots);
+  }
+  return roots;
+}
+
+function fileTitleNodes(el) {
+  if (!el || el.nodeType !== 1) return [];
+  let nodes = titleCache.get(el);
+  if (!nodes) {
+    nodes = [...el.querySelectorAll(FILE_TITLE_SELECTOR)];
+    titleCache.set(el, nodes);
+  }
+  return nodes;
 }
 
 function headerPath(el) {
@@ -132,65 +226,58 @@ function pathsMatch(left, right) {
   return a === b || basename(a).toLowerCase() === basename(b).toLowerCase();
 }
 
+// Text of `el` excluding nested tree rows, groups and diff headers, without cloning the subtree.
+function collectOwnText(el) {
+  let text = "";
+  for (const child of el.childNodes) {
+    if (child.nodeType === Node.TEXT_NODE) {
+      text += child.nodeValue;
+    } else if (child.nodeType === Node.ELEMENT_NODE && !child.matches(OWN_TEXT_SKIP_SELECTOR)) {
+      text += collectOwnText(child);
+    }
+  }
+  return text;
+}
+
 function ownLabelText(el) {
   if (!el) return "";
   const titled = `${el.getAttribute("title") || ""} ${el.getAttribute("aria-label") || ""}`.trim();
   if (titled && fileNameTokens(titled).length === 1) return titled;
-
-  const clone = el.cloneNode(true);
-  clone
-    .querySelectorAll('[role="treeitem"], [role="group"], [data-tree-entry-type], [class*="DiffFileHeader"], .file-header')
-    .forEach((node) => {
-      if (node !== clone) node.remove();
-    });
-  return (clone.textContent || "").replace(/\s+/g, " ").trim();
+  return collectOwnText(el).replace(/\s+/g, " ").trim();
 }
 
-function exclusiveLabel(el, path) {
-  if (!el || !path) return null;
+// Finds the innermost node inside `scope` whose text is exactly the file's basename. `scope`
+// should be the file header or tree row, never the whole diff card: the diff body has thousands
+// of spans and a code line mentioning the file name would otherwise win.
+function exclusiveLabel(scope, path) {
+  if (!scope || !path) return null;
   const base = basename(path).toLowerCase();
-  const nodes = [el, ...el.querySelectorAll("a, span, [class*='file-name'], [class*='ItemLabel']")];
+  const nodes = [scope, ...scope.querySelectorAll(LABEL_SELECTOR)];
   let best = null;
   for (const node of nodes) {
-    if (node.id === "gco-bar" || node.closest?.("#gco-bar")) continue;
-    const text = `${node.getAttribute?.("title") || ""} ${node.getAttribute?.("aria-label") || ""} ${
-      node.textContent || ""
-    }`;
-    if (!textMatchesExclusivePath(text, path)) continue;
-    best = node;
+    if (isOurs(node)) continue;
+    const text = `${node.getAttribute("title") || ""} ${node.getAttribute("aria-label") || ""} ${node.textContent || ""}`;
+    if (textMatchesExclusivePath(text, path)) best = node;
   }
   if (best) return best;
   for (const node of nodes) {
+    if (isOurs(node)) continue;
     const text = (node.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
     if (text === base || text.endsWith(`/${base}`)) best = node;
   }
   return best;
 }
 
-function fileTitleNodes(el) {
-  if (!el?.querySelectorAll) return [];
-  return [
-    ...el.querySelectorAll(
-      '[class*="DiffFileHeader-module__file-name"], [class*="DiffFileHeader-module__fileName"], .file-header a.Link--primary'
-    ),
-  ];
-}
-
+// Walks up from a header until the next ancestor would contain more than one file.
 function expandExclusiveCard(start) {
   if (!start) return null;
   let card = start;
   let node = start.parentElement;
   while (node && node !== document.body) {
-    if (isLayoutNode(node) || node.id === "diff-layout-component") break;
+    if (isLayoutNode(node)) break;
     if (headerRoots(node).length > 1 || fileTitleNodes(node).length > 1) break;
     card = node;
-    if (
-      node.matches?.(
-        "div.file.js-file, copilot-diff-entry, [data-details-container-group='file'], details, .js-details-container"
-      )
-    ) {
-      return node;
-    }
+    if (node.matches(FILE_CARD_SELECTOR)) return node;
     node = node.parentElement;
   }
   return card;
@@ -207,13 +294,24 @@ function fileSlice(header) {
   return nodes;
 }
 
-function visualTargets(el, path) {
-  if (el.closest?.('[role="tree"]')) {
-    const treeRow = el.closest('[role="treeitem"], [data-tree-entry-type="file"]') || el;
-    const nested = [...treeRow.querySelectorAll('[role="treeitem"], [data-tree-entry-type="file"]')].filter(
-      (node) => node !== treeRow
-    );
-    if (treeRow.hasAttribute("aria-expanded") || nested.length > 0) {
+function findMatchingHeader(el, path) {
+  if (!el || !path) return null;
+  const roots = headerRoots(el);
+  const match = roots.find((header) => pathsMatch(headerPath(header), path));
+  if (match) return match;
+  if (isHeaderRoot(el) && pathsMatch(headerPath(el), path)) return el;
+  const closest = el.closest(HEADER_SELECTOR);
+  if (closest && pathsMatch(headerPath(closest), path)) return closest;
+  return null;
+}
+
+// Resolves the elements that should be dimmed for an item. Also records the header and card on
+// the item so the collapse pass does not have to find them again.
+function visualTargets(item) {
+  const { el, path } = item;
+  if (el.closest('[role="tree"]')) {
+    const treeRow = el.closest(TREE_ROW_SELECTOR) || el;
+    if (treeRow.hasAttribute("aria-expanded") || treeRow.querySelector(TREE_ROW_SELECTOR)) {
       const label = exclusiveLabel(treeRow, path);
       return label ? [label] : [];
     }
@@ -222,24 +320,13 @@ function visualTargets(el, path) {
 
   const header = findMatchingHeader(el, path);
   const card = expandExclusiveCard(header || el);
+  item.header = header;
+  item.card = card;
   if (card && headerRoots(card).length <= 1 && fileTitleNodes(card).length <= 1 && !isLayoutNode(card)) {
     return [card];
   }
   if (header) return fileSlice(header);
   return [el];
-}
-
-function findMatchingHeader(el, path) {
-  if (!el || !path) return null;
-  const roots = headerRoots(el);
-  const match = roots.find((header) => pathsMatch(headerPath(header), path));
-  if (match) return match;
-  if (isHeaderRoot(el) && pathsMatch(headerPath(el), path)) return el;
-  const closest = el.closest?.(
-    ".file-header, [class*='DiffFileHeader-module__diff-file-header'], [class*='Diff-module__diffHeaderWrapper']"
-  );
-  if (closest && pathsMatch(headerPath(closest), path)) return closest;
-  return null;
 }
 
 function fileUnitFrom(node) {
@@ -256,55 +343,51 @@ function fileUnitFrom(node) {
   const header =
     node.closest('[class*="DiffFileHeader-module__diff-file-header"]') ||
     node.closest('[class*="Diff-module__diffHeaderWrapper"]') ||
-    (node.classList?.contains("file-header") ? node : null);
+    (node.classList.contains("file-header") ? node : null);
   if (header) return expandExclusiveCard(header) || header;
   return expandExclusiveCard(node);
 }
 
-function clearMarks() {
-  document.querySelectorAll(`.${DIMMED_CLASS}, .${FOCUS_CLASS}, .${STRIKE_CLASS}`).forEach((el) => {
-    if (el.id === "gco-bar" || el.closest("#gco-bar")) return;
-    el.classList.remove(DIMMED_CLASS, FOCUS_CLASS, STRIKE_CLASS);
-    el.removeAttribute("data-gco-reason");
-  });
-}
-
 function collectDiffs() {
-  const nodes = [
-    ...document.querySelectorAll("copilot-diff-entry[data-file-path]"),
-    ...document.querySelectorAll("div.file.js-file[data-tagsearch-path]"),
-    ...document.querySelectorAll("div.file-header[data-path]"),
-    ...document.querySelectorAll('[class*="DiffFileHeader-module__diff-file-header"]'),
-    ...document.querySelectorAll('[class*="DiffFileHeader-module__file-name"]'),
-    ...document.querySelectorAll('[class*="Diff-module__diffHeaderWrapper"]'),
-  ];
-
   const seen = new Set();
   const diffs = [];
-  for (const node of nodes) {
-    const target = fileUnitFrom(node);
-    if (!target || seen.has(target)) continue;
-    let path = normalizePath(pathFromElement(target) || pathFromElement(node));
-    if (!path) path = pathFromReactHeader(target) || pathFromReactHeader(node);
-    if (!path) continue;
-    seen.add(target);
-    diffs.push({ path, el: target });
+  for (const selector of DIFF_NODE_SELECTORS) {
+    for (const node of document.querySelectorAll(selector)) {
+      const target = fileUnitFrom(node);
+      if (!target || seen.has(target)) continue;
+      let path = normalizePath(pathFromElement(target) || pathFromElement(node));
+      if (!path) path = pathFromReactHeader(target) || pathFromReactHeader(node);
+      if (!path) continue;
+      seen.add(target);
+      diffs.push({ path, el: target, reason: hideReason(path) });
+    }
   }
   return diffs;
 }
 
-function directTreeLabel(el) {
+function computeTreeLabel(el) {
   const titled = looksLikePath(el.getAttribute("title") || "") || looksLikePath(el.getAttribute("aria-label") || "");
   if (titled && fileNameTokens(titled).length <= 1) return titled;
 
   const own = ownLabelText(el);
+  if (!own) return "";
   const tokens = fileNameTokens(own);
   if (tokens.length === 1) return tokens[0];
-  if (own && fileNameTokens(own).length <= 1) {
-    const text = own.replace(/\u200E/g, " ").replace(/\s+/g, " ").trim();
-    if (text) return text.split(" ")[0];
+  if (tokens.length === 0) {
+    const text = own.replace(/‎/g, " ").replace(/\s+/g, " ").trim();
+    return text ? text.split(" ")[0] : "";
   }
   return "";
+}
+
+// Directory rows are visited once per file beneath them, so their label is cached per run.
+function directTreeLabel(el) {
+  let label = treeLabelCache.get(el);
+  if (label === undefined) {
+    label = computeTreeLabel(el);
+    treeLabelCache.set(el, label);
+  }
+  return label;
 }
 
 function pathFromTreeItem(el) {
@@ -312,20 +395,17 @@ function pathFromTreeItem(el) {
   if (attr.includes("/") && fileNameTokens(attr).length <= 1) return attr;
 
   const ownName = directTreeLabel(el);
-  const parts = [];
-  if (ownName && !ownName.includes("/")) parts.push(ownName);
-  else if (ownName.includes("/")) return ownName;
+  if (ownName.includes("/")) return ownName;
+  const parts = ownName ? [ownName] : [];
 
   const treeRoot = el.closest('[role="tree"]');
   let node = el.parentElement;
   while (node && node !== treeRoot) {
     const isItem =
-      node.getAttribute?.("role") === "treeitem" ||
-      node.getAttribute?.("data-tree-entry-type") === "directory";
+      node.getAttribute("role") === "treeitem" || node.getAttribute("data-tree-entry-type") === "directory";
     if (isItem) {
       const name = directTreeLabel(node);
-      const nameTokens = fileNameTokens(name);
-      if (name && nameTokens.length === 0 && !name.includes(".")) {
+      if (name && !name.includes(".") && fileNameTokens(name).length === 0) {
         parts.unshift(name);
       }
     }
@@ -334,28 +414,20 @@ function pathFromTreeItem(el) {
   return parts.join("/");
 }
 
-function treePathFallback(el) {
-  return pathFromTreeItem(el);
-}
-
 function collectTreeFiles() {
-  const items = [
-    ...document.querySelectorAll("[data-tree-entry-type='file']"),
-    ...document.querySelectorAll('[role="tree"] [role="treeitem"]'),
-    ...document.querySelectorAll('[role="tree"] a[href]'),
-  ];
   const seen = new Set();
   const files = [];
-  for (const el of items) {
+  for (const el of document.querySelectorAll(TREE_ITEM_SELECTOR)) {
     if (el.getAttribute("data-tree-entry-type") === "directory") continue;
     if (el.hasAttribute("aria-expanded")) continue;
-    if (el.querySelector('[role="treeitem"], [data-tree-entry-type="file"], [data-tree-entry-type="directory"]')) {
-      continue;
-    }
-    const path = normalizePath(pathFromTreeItem(el) || treePathFallback(el) || looksLikePath(el.textContent || ""));
-    if (!path || !basename(path).includes(".") || seen.has(el)) continue;
-    seen.add(el);
-    files.push({ path, el });
+    // A row and the link inside it describe the same file; keep the first one seen.
+    const row = el.closest(TREE_ROW_SELECTOR) || el;
+    if (seen.has(row)) continue;
+    if (el.querySelector(TREE_NODE_SELECTOR)) continue;
+    const path = normalizePath(pathFromTreeItem(el) || looksLikePath(el.textContent || ""));
+    if (!path || !basename(path).includes(".")) continue;
+    seen.add(row);
+    files.push({ path, el, reason: hideReason(path) });
   }
   return files;
 }
@@ -377,14 +449,18 @@ function isCollapseControl(btn) {
   return true;
 }
 
-function findCollapseButton(header, collapsed) {
-  const scope = header || document;
-  const buttons = [...scope.querySelectorAll("button")].filter(isCollapseControl);
+function collapseControls(scope) {
+  return [...scope.querySelectorAll("button")].filter(isCollapseControl);
+}
 
+function findCollapseButton(buttons, collapsed) {
   for (const btn of buttons) {
     const expanded = btn.getAttribute("aria-expanded");
-    if (collapsed && expanded === "true") return btn;
-    if (!collapsed && expanded === "false") return btn;
+    // When a button declares aria-expanded, trust it over its icon or label.
+    if (expanded === "true" || expanded === "false") {
+      if ((expanded === "true") === collapsed) return btn;
+      continue;
+    }
     if (collapsed && btn.querySelector(".octicon-chevron-down, .octicon-triangle-down")) return btn;
     if (!collapsed && btn.querySelector(".octicon-chevron-right, .octicon-triangle-right")) return btn;
     const label = (btn.getAttribute("aria-label") || "").toLowerCase();
@@ -392,7 +468,10 @@ function findCollapseButton(header, collapsed) {
       if (expanded === "false") continue;
       return btn;
     }
-    if (!collapsed && (label.includes("expand file") || label === "expand" || label.includes("toggle diff") || label.includes("toggle file"))) {
+    if (
+      !collapsed &&
+      (label.includes("expand file") || label === "expand" || label.includes("toggle diff") || label.includes("toggle file"))
+    ) {
       if (expanded === "true") continue;
       return btn;
     }
@@ -400,10 +479,16 @@ function findCollapseButton(header, collapsed) {
   return null;
 }
 
-function setDiffCollapsed(fileEl, collapsed, path) {
-  const header = findMatchingHeader(fileEl, path) || fileEl;
-  if (!header || header.id === "diff-layout-component") return false;
-  const card = expandExclusiveCard(header);
+function liveNode(el) {
+  return el && el.isConnected ? el : null;
+}
+
+// Returns true when the diff was toggled, false when it was already in the requested state, and
+// null when no collapse control could be found (so a later run may try again).
+function setDiffCollapsed(item, collapsed) {
+  const header = liveNode(item.header) || findMatchingHeader(item.el, item.path) || item.el;
+  if (header.id === "diff-layout-component") return null;
+  const card = liveNode(item.card) || expandExclusiveCard(header);
 
   if (card && headerRoots(card).length <= 1) {
     const details = card.matches("details") ? card : card.querySelector(":scope > details");
@@ -424,80 +509,129 @@ function setDiffCollapsed(fileEl, collapsed, path) {
     }
   }
 
-  const btn = findCollapseButton(header, collapsed) || (card && card !== header ? findCollapseButton(card, collapsed) : null);
-  if (!btn) return false;
-  btn.click();
-  return true;
+  let buttons = collapseControls(header);
+  let btn = findCollapseButton(buttons, collapsed);
+  if (!btn && card && card !== header) {
+    const cardButtons = collapseControls(card);
+    buttons = buttons.concat(cardButtons);
+    btn = findCollapseButton(cardButtons, collapsed);
+  }
+  if (btn) {
+    btn.click();
+    return true;
+  }
+  return buttons.length > 0 ? false : null;
 }
 
-function collapseSkippedDiffs(collapsed) {
+// While GitHub re-renders after our collapse clicks, mutations are queued instead of re-applied,
+// then one pass runs once things settle so lazily loaded files are not missed.
+function settleAfterCollapse() {
   syncingCollapse = true;
-  observer?.disconnect();
-  try {
-    for (const item of collectDiffs()) {
-      if (!shouldHide(item.path, settings)) continue;
-      setDiffCollapsed(item.el, collapsed, item.path);
+  window.clearTimeout(collapseSettleTimer);
+  collapseSettleTimer = window.setTimeout(() => {
+    syncingCollapse = false;
+    if (pendingApply) {
+      pendingApply = false;
+      scheduleApply();
     }
-  } finally {
-    window.setTimeout(() => {
-      syncingCollapse = false;
-      observe();
-    }, 250);
+  }, COLLAPSE_SETTLE_MS);
+}
+
+function collapseDiffs(items, collapsed, force = false) {
+  let touched = false;
+  for (const item of items) {
+    if (!item.reason) continue;
+    if (collapsed && !force && autoCollapsed.has(item.path)) continue;
+    const result = setDiffCollapsed(item, collapsed);
+    if (result === null) continue;
+    if (collapsed) autoCollapsed.add(item.path);
+    else autoCollapsed.delete(item.path);
+    if (result) touched = true;
   }
+  if (touched) settleAfterCollapse();
+}
+
+function setReason(el, reason) {
+  const current = el.getAttribute(REASON_ATTR);
+  if (reason) {
+    if (current !== reason) el.setAttribute(REASON_ATTR, reason);
+  } else if (current !== null) {
+    el.removeAttribute(REASON_ATTR);
+  }
+}
+
+function unmark(el) {
+  el.classList.remove(DIMMED_CLASS, FOCUS_CLASS, STRIKE_CLASS);
+  el.removeAttribute(REASON_ATTR);
+}
+
+function clearMarks() {
+  document.querySelectorAll(`.${DIMMED_CLASS}, .${FOCUS_CLASS}, .${STRIKE_CLASS}`).forEach((el) => {
+    if (!isOurs(el)) unmark(el);
+  });
+  marked = new Set();
 }
 
 function applyFilters() {
   if (!onReviewPage()) {
-    document.getElementById("gco-bar")?.remove();
+    document.getElementById(BAR_ID)?.remove();
     return;
   }
 
+  beginRun();
   ensureBar();
-  clearMarks();
 
   const diffs = collectDiffs();
-  const treeFiles = collectTreeFiles();
-  const uniquePaths = new Set();
+  const items = diffs.concat(collectTreeFiles());
 
-  const applyTo = (item) => {
-    if (!item.path) return;
-    uniquePaths.add(item.path);
-    const reason = shouldHide(item.path, settings);
-    const targets = visualTargets(item.el, item.path);
+  // Decide the final state of every element first, then touch each class exactly once.
+  const dimState = new Map();
+  const strikeState = new Map();
+  for (const item of items) {
+    const targets = visualTargets(item);
     for (const target of targets) {
-      if (!target || target.id === "gco-bar" || target.closest("#gco-bar")) continue;
-      target.classList.toggle(DIMMED_CLASS, Boolean(reason));
-      target.classList.toggle(FOCUS_CLASS, !reason);
-      if (reason) target.setAttribute("data-gco-reason", reason);
-      else target.removeAttribute("data-gco-reason");
+      if (target && !isOurs(target)) dimState.set(target, item.reason);
     }
-    const label = exclusiveLabel(item.el, item.path);
+    const label = exclusiveLabel(item.header || item.el, item.path);
     if (label && label !== item.el) {
-      label.classList.toggle(STRIKE_CLASS, Boolean(reason));
-    } else if (reason && targets[0]) {
-      targets[0].classList.add(STRIKE_CLASS);
+      strikeState.set(label, Boolean(item.reason));
+    } else if (item.reason && targets[0] && !isOurs(targets[0])) {
+      strikeState.set(targets[0], true);
     }
-  };
-
-  diffs.forEach(applyTo);
-  treeFiles.forEach(applyTo);
-
-  const dimmedPaths = new Set(
-    [...diffs, ...treeFiles].filter((item) => shouldHide(item.path, settings)).map((item) => item.path)
-  );
-  const dimmedCount = dimmedPaths.size;
-  const total = uniquePaths.size || dimmedCount;
-  const focused = Math.max(total - dimmedCount, 0);
-
-  updateBar(dimmedCount, focused);
-  if (settings.autoCollapse !== false && !syncingCollapse) {
-    collapseSkippedDiffs(true);
   }
+
+  const nextMarked = new Set();
+  for (const [el, reason] of dimState) {
+    el.classList.toggle(DIMMED_CLASS, Boolean(reason));
+    el.classList.toggle(FOCUS_CLASS, !reason);
+    // classList.remove rewrites the attribute even when the class is absent; toggle does not.
+    if (!strikeState.has(el)) el.classList.toggle(STRIKE_CLASS, false);
+    setReason(el, reason);
+    nextMarked.add(el);
+  }
+  for (const [el, on] of strikeState) {
+    el.classList.toggle(STRIKE_CLASS, on);
+    nextMarked.add(el);
+  }
+  for (const el of marked) {
+    if (!nextMarked.has(el)) unmark(el);
+  }
+  marked = nextMarked;
+
+  const allPaths = new Set();
+  const dimmedPaths = new Set();
+  for (const item of items) {
+    allPaths.add(item.path);
+    if (item.reason) dimmedPaths.add(item.path);
+  }
+  updateBar(dimmedPaths.size, Math.max(allPaths.size - dimmedPaths.size, 0));
+
+  if (settings.autoCollapse !== false) collapseDiffs(diffs, true);
 }
 
 function scheduleApply() {
   window.clearTimeout(applyTimer);
-  applyTimer = window.setTimeout(applyFilters, 60);
+  applyTimer = window.setTimeout(applyFilters, APPLY_DEBOUNCE_MS);
 }
 
 function allOptionalOn() {
@@ -524,56 +658,84 @@ function findHost() {
   );
 }
 
-function ensureBar() {
-  let bar = document.getElementById("gco-bar");
-  if (!bar) {
-    bar = document.createElement("div");
-    bar.id = "gco-bar";
-    bar.className = "gco-bar";
-    bar.setAttribute("role", "toolbar");
-    bar.setAttribute("aria-label", "Code Only review filter");
-    bar.innerHTML = `
-      <span class="gco-brand" title="GitHub Code Only">Code Only</span>
-      ${FILTERS.map(
-        (filter) => `
-          <button type="button" class="gco-chip" data-filter="${filter.id}" title="${filter.title}" aria-pressed="false">
-            ${filter.label}
-          </button>`
-      ).join("")}
-      <button type="button" class="gco-chip gco-chip-all" data-action="all" title="Dim tests, ADRs, specs, and AI files">
-        Code only
-      </button>
-      <button type="button" class="gco-chip" data-action="collapse-toggle" title="Collapse or expand skipped diffs">
-        Collapse skipped
-      </button>
-      <span class="gco-count" data-role="count"></span>
-    `;
+function chipButton(label, title) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "gco-chip";
+  button.title = title;
+  button.textContent = label;
+  return button;
+}
 
-    bar.addEventListener("click", async (event) => {
-      const button = event.target.closest("button");
-      if (!button) return;
+function buildBar() {
+  const bar = document.createElement("div");
+  bar.id = BAR_ID;
+  bar.className = "gco-bar";
+  bar.setAttribute("role", "toolbar");
+  bar.setAttribute("aria-label", "Code Only review filter");
 
-      if (button.dataset.action === "all") {
-        const enable = !allOptionalOn();
-        for (const filter of FILTERS) settings[filter.id] = enable;
-      } else if (button.dataset.action === "collapse-toggle") {
-        settings.autoCollapse = settings.autoCollapse === false;
-        await saveSettings();
-        renderBarState();
-        collapseSkippedDiffs(settings.autoCollapse !== false);
-        return;
-      } else if (button.dataset.filter) {
-        const id = button.dataset.filter;
-        settings[id] = !settings[id];
-      } else {
-        return;
-      }
+  const brand = document.createElement("span");
+  brand.className = "gco-brand";
+  brand.title = "GitHub Code Only";
+  brand.textContent = "Code Only";
+  bar.append(brand);
 
-      await saveSettings();
-      renderBarState();
-      applyFilters();
-    });
+  for (const filter of FILTERS) {
+    const chip = chipButton(filter.label, filter.title);
+    chip.dataset.filter = filter.id;
+    chip.setAttribute("aria-pressed", "false");
+    bar.append(chip);
   }
+
+  const all = chipButton("Code only", "Dim tests, ADRs, specs, and AI files");
+  all.classList.add("gco-chip-all");
+  all.dataset.action = "all";
+
+  const collapse = chipButton("Collapse skipped", "Collapse or expand skipped diffs");
+  collapse.dataset.action = "collapse-toggle";
+
+  const count = document.createElement("span");
+  count.className = "gco-count";
+  count.dataset.role = "count";
+
+  bar.append(all, collapse, count);
+  bar.addEventListener("click", onBarClick);
+  return bar;
+}
+
+function onBarClick(event) {
+  const button = event.target.closest("button");
+  if (!button) return;
+  const { action, filter } = button.dataset;
+
+  if (action === "collapse-toggle") {
+    settings.autoCollapse = settings.autoCollapse === false;
+    renderBarState();
+    beginRun();
+    collapseDiffs(collectDiffs(), settings.autoCollapse !== false, true);
+    saveSettings();
+    return;
+  }
+
+  if (action === "all") {
+    const enable = !allOptionalOn();
+    for (const item of FILTERS) settings[item.id] = enable;
+  } else if (filter) {
+    settings[filter] = !settings[filter];
+  } else {
+    return;
+  }
+
+  // Update the page first, then persist; the storage change event is a no-op for identical settings.
+  autoCollapsed.clear();
+  renderBarState();
+  applyFilters();
+  saveSettings();
+}
+
+function ensureBar() {
+  let bar = document.getElementById(BAR_ID);
+  if (!bar) bar = buildBar();
 
   const host = findHost();
   bar.classList.toggle("gco-bar--floating", !host);
@@ -584,93 +746,103 @@ function ensureBar() {
   return bar;
 }
 
+function setPressed(el, on) {
+  el.classList.toggle("is-on", on);
+  const value = String(on);
+  if (el.getAttribute("aria-pressed") !== value) el.setAttribute("aria-pressed", value);
+}
+
 function renderBarState() {
-  const bar = document.getElementById("gco-bar");
+  const bar = document.getElementById(BAR_ID);
   if (!bar) return;
   for (const filter of FILTERS) {
     const chip = bar.querySelector(`[data-filter="${filter.id}"]`);
-    if (!chip) continue;
-    const on = Boolean(settings[filter.id]);
-    chip.classList.toggle("is-on", on);
-    chip.setAttribute("aria-pressed", String(on));
+    if (chip) setPressed(chip, Boolean(settings[filter.id]));
   }
   const all = bar.querySelector('[data-action="all"]');
-  if (all) {
-    const on = allOptionalOn();
-    all.classList.toggle("is-on", on);
-    all.setAttribute("aria-pressed", String(on));
-  }
+  if (all) setPressed(all, allOptionalOn());
+
   const collapse = bar.querySelector('[data-action="collapse-toggle"]');
   if (collapse) {
     const on = settings.autoCollapse !== false;
-    collapse.classList.toggle("is-on", on);
-    collapse.setAttribute("aria-pressed", String(on));
-    collapse.textContent = on ? "Expand skipped" : "Collapse skipped";
-    collapse.title = on
+    setPressed(collapse, on);
+    const text = on ? "Expand skipped" : "Collapse skipped";
+    const title = on
       ? "Skipped diffs are auto-collapsed. Click to expand them."
       : "Collapse skipped diffs and keep collapsing them as files load";
+    if (collapse.textContent !== text) collapse.textContent = text;
+    if (collapse.title !== title) collapse.title = title;
   }
 }
 
 function updateBar(dimmed, focused) {
-  const count = document.querySelector("#gco-bar [data-role='count']");
+  const count = document.querySelector(`#${BAR_ID} [data-role='count']`);
   if (!count) return;
-  if (dimmed === 0) {
-    count.textContent = `${focused} file${focused === 1 ? "" : "s"} in focus`;
-  } else {
-    count.textContent = `${dimmed} dimmed · ${focused} in focus`;
+  const text =
+    dimmed === 0 ? `${focused} file${focused === 1 ? "" : "s"} in focus` : `${dimmed} dimmed · ${focused} in focus`;
+  if (count.textContent !== text) count.textContent = text;
+}
+
+function isRelevantMutation(mutations) {
+  for (const mutation of mutations) {
+    const target = mutation.target;
+    if (target.nodeType === 1 && isOurs(target)) continue;
+    for (const node of mutation.addedNodes) {
+      if (node.nodeType !== 1) continue;
+      if (node.matches(RELEVANT_SELECTOR) || node.querySelector(RELEVANT_SELECTOR)) return true;
+    }
   }
+  return false;
+}
+
+function resetPage() {
+  lastUrl = location.href;
+  document.getElementById(BAR_ID)?.remove();
+  clearMarks();
+  autoCollapsed.clear();
+  pendingApply = false;
+}
+
+function onMutations(mutations) {
+  if (location.href !== lastUrl) {
+    resetPage();
+    scheduleApply();
+    return;
+  }
+  if (!onReviewPage()) return;
+  if (!isRelevantMutation(mutations)) return;
+  if (syncingCollapse) {
+    pendingApply = true;
+    return;
+  }
+  scheduleApply();
 }
 
 function observe() {
-  observer?.disconnect();
-  observer = new MutationObserver((mutations) => {
-    if (syncingCollapse) return;
-    if (location.href !== lastUrl) {
-      lastUrl = location.href;
-      document.getElementById("gco-bar")?.remove();
-      scheduleApply();
-      return;
-    }
-    const relevant = mutations.some((mutation) => {
-      if (mutation.target?.closest?.("#gco-bar")) return false;
-      return [...mutation.addedNodes].some(
-        (node) =>
-          node.nodeType === 1 &&
-          (node.matches?.(
-            "div.file, copilot-diff-entry, li.js-tree-node, .pr-toolbar, #files, [class*='Diff-module'], [class*='DiffFileHeader-module'], [role='treeitem']"
-          ) ||
-            node.querySelector?.(
-              "div.file, copilot-diff-entry, li.js-tree-node, .pr-toolbar, #files, [class*='Diff-module'], [class*='DiffFileHeader-module'], [role='treeitem']"
-            ))
-      );
-    });
-    if (relevant) scheduleApply();
-  });
+  if (!observer) observer = new MutationObserver(onMutations);
   observer.observe(document.documentElement, { childList: true, subtree: true });
 }
 
+function onNavigate() {
+  if (location.href !== lastUrl) resetPage();
+  else document.getElementById(BAR_ID)?.remove();
+  scheduleApply();
+}
+
 function bindNavigation() {
-  const rerun = () => {
-    lastUrl = location.href;
-    document.getElementById("gco-bar")?.remove();
-    scheduleApply();
-  };
-  document.addEventListener("turbo:load", rerun);
-  document.addEventListener("turbo:render", rerun);
-  document.addEventListener("pjax:end", rerun);
-  document.addEventListener("soft-nav:end", rerun);
-  window.addEventListener("popstate", rerun);
+  document.addEventListener("turbo:load", onNavigate);
+  document.addEventListener("turbo:render", onNavigate);
+  document.addEventListener("pjax:end", onNavigate);
+  document.addEventListener("soft-nav:end", onNavigate);
+  window.addEventListener("popstate", onNavigate);
 }
 
 storage.onChanged.addListener((changes, area) => {
   if (area !== "sync" || !changes[STORAGE_KEY]) return;
-  const value = changes[STORAGE_KEY].newValue || {};
-  settings = {
-    ...DEFAULT_SETTINGS,
-    ...value,
-    custom: Array.isArray(value.custom) ? value.custom : [],
-  };
+  const next = mergeSettings(changes[STORAGE_KEY].newValue);
+  if (JSON.stringify(next) === JSON.stringify(settings)) return;
+  settings = next;
+  autoCollapsed.clear();
   renderBarState();
   scheduleApply();
 });

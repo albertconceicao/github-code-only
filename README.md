@@ -44,6 +44,8 @@ In Firefox the extension goes away when you close the browser unless you sign it
 
 On GitHub's new UI (`/changes`) the chips sit in a panel at the top right. Reload the extension in `chrome://extensions` after updating the files.
 
+Skipped diffs are collapsed once when they appear. If you expand one by hand it stays open until you change a filter or leave the page. **Collapse skipped** / **Expand skipped** always applies to every skipped file.
+
 Also works on commits and compare views.
 
 ## Development
