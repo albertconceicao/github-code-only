@@ -89,6 +89,12 @@
   color: var(--fgColor-success, #1a7f37);
 }
 
+.gco-chip[data-action="collapse-toggle"].is-on {
+  border-color: var(--borderColor-attention-emphasis, #9a6700);
+  background: var(--bgColor-attention-muted, #fff8c5);
+  color: var(--fgColor-attention, #9a6700);
+}
+
 .gco-count {
   color: var(--fgColor-muted, #656d76);
   margin-left: 4px;

@@ -2,7 +2,9 @@
 
 Browser extension for GitHub's **Files changed** tab. It dims tests and, if you turn them on, ADRs, specs, and AI-generated files — so review stays on real code.
 
-Matched files stay in the tree and the diff, with a strikethrough and lower opacity.
+Matched files stay in the tree and the diff, with a strikethrough, lower opacity, and collapsed diffs on load.
+
+The overlay includes **Collapse skipped** / **Expand skipped** so you can fold or unfold all skipped files in one click.
 
 ## What it does
 

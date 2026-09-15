@@ -4,6 +4,7 @@ const DEFAULT_SETTINGS = {
   adrs: false,
   specs: false,
   ai: false,
+  autoCollapse: true,
   custom: [],
 };
 

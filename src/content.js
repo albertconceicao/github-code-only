@@ -9,6 +9,7 @@ const DEFAULT_SETTINGS = {
   adrs: false,
   specs: false,
   ai: false,
+  autoCollapse: true,
   custom: [],
 };
 
@@ -25,6 +26,7 @@ let settings = { ...DEFAULT_SETTINGS };
 let applyTimer = 0;
 let observer = null;
 let lastUrl = location.href;
+let syncingCollapse = false;
 
 function onReviewPage() {
   return isReviewPage(location.pathname);
@@ -214,6 +216,100 @@ function dimFullyFilteredDirectories() {
   }
 }
 
+function isCollapseControl(btn) {
+  const label = (btn.getAttribute("aria-label") || "").toLowerCase();
+  if (
+    label.includes("viewed") ||
+    label.includes("copy") ||
+    label.includes("menu") ||
+    label.includes("comment") ||
+    label.includes("expand up") ||
+    label.includes("expand down") ||
+    label.includes("expand all")
+  ) {
+    return false;
+  }
+  if (btn.querySelector(".octicon-kebab-horizontal, .octicon-copy, .octicon-eye")) return false;
+  return true;
+}
+
+function diffHeader(container) {
+  return (
+    container.querySelector(
+      ".file-header, [class*='DiffFileHeader'], [class*='Diff-module__diffHeader']"
+    ) || container
+  );
+}
+
+function findCollapseButton(container, collapsed) {
+  const scope = diffHeader(container);
+  const buttons = [...scope.querySelectorAll("button")].filter(isCollapseControl);
+
+  for (const btn of buttons) {
+    const expanded = btn.getAttribute("aria-expanded");
+    if (collapsed && expanded === "true") return btn;
+    if (!collapsed && expanded === "false") return btn;
+    if (collapsed && btn.querySelector(".octicon-chevron-down, .octicon-triangle-down")) return btn;
+    if (!collapsed && btn.querySelector(".octicon-chevron-right, .octicon-triangle-right")) return btn;
+    const label = (btn.getAttribute("aria-label") || "").toLowerCase();
+    if (collapsed && (label.includes("collapse") || label.includes("toggle diff") || label.includes("toggle file"))) {
+      if (expanded === "false") continue;
+      return btn;
+    }
+    if (!collapsed && (label.includes("expand file") || label === "expand" || label.includes("toggle diff") || label.includes("toggle file"))) {
+      if (expanded === "true") continue;
+      return btn;
+    }
+  }
+  return null;
+}
+
+function setDiffCollapsed(fileEl, collapsed) {
+  const container =
+    fileEl.closest("div.file.js-file, copilot-diff-entry, [data-details-container-group='file'], [id^='diff-']") ||
+    fileEl.closest('[class*="Diff-module"]') ||
+    fileEl;
+  if (!container || container.id === "diff-layout-component") return false;
+
+  const details = container.matches("details") ? container : container.querySelector(":scope > details");
+  if (details && typeof details.open === "boolean") {
+    if (details.open === !collapsed) return false;
+    details.open = !collapsed;
+    return true;
+  }
+
+  if (container.classList.contains("js-details-container") || container.classList.contains("Details")) {
+    const isOpen = container.classList.contains("open") || container.classList.contains("Details--on");
+    if (isOpen === !collapsed) return false;
+    container.classList.toggle("open", !collapsed);
+    container.classList.toggle("Details--on", !collapsed);
+    const btn = container.querySelector(".file-header [aria-expanded], button[aria-label='Toggle diff contents']");
+    if (btn) btn.setAttribute("aria-expanded", String(!collapsed));
+    return true;
+  }
+
+  const btn = findCollapseButton(container, collapsed);
+  if (!btn) return false;
+  btn.click();
+  return true;
+}
+
+function collapseSkippedDiffs(collapsed) {
+  syncingCollapse = true;
+  observer?.disconnect();
+  try {
+    for (const item of collectDiffs()) {
+      if (!item.el.classList.contains(DIMMED_CLASS)) continue;
+      setDiffCollapsed(item.el, collapsed);
+    }
+  } finally {
+    window.setTimeout(() => {
+      syncingCollapse = false;
+      observe();
+    }, 250);
+  }
+}
+
 function applyFilters() {
   if (!onReviewPage()) {
     document.getElementById("gco-bar")?.remove();
@@ -250,6 +346,9 @@ function applyFilters() {
 
   dimFullyFilteredDirectories();
   updateBar(dimmedCount, focused);
+  if (settings.autoCollapse !== false && !syncingCollapse) {
+    collapseSkippedDiffs(true);
+  }
 }
 
 function scheduleApply() {
@@ -300,6 +399,9 @@ function ensureBar() {
       <button type="button" class="gco-chip gco-chip-all" data-action="all" title="Dim tests, ADRs, specs, and AI files">
         Code only
       </button>
+      <button type="button" class="gco-chip" data-action="collapse-toggle" title="Collapse or expand skipped diffs">
+        Collapse skipped
+      </button>
       <span class="gco-count" data-role="count"></span>
     `;
 
@@ -310,6 +412,12 @@ function ensureBar() {
       if (button.dataset.action === "all") {
         const enable = !allOptionalOn();
         for (const filter of FILTERS) settings[filter.id] = enable;
+      } else if (button.dataset.action === "collapse-toggle") {
+        settings.autoCollapse = settings.autoCollapse === false;
+        await saveSettings();
+        renderBarState();
+        collapseSkippedDiffs(settings.autoCollapse !== false);
+        return;
       } else if (button.dataset.filter) {
         const id = button.dataset.filter;
         settings[id] = !settings[id];
@@ -348,6 +456,16 @@ function renderBarState() {
     all.classList.toggle("is-on", on);
     all.setAttribute("aria-pressed", String(on));
   }
+  const collapse = bar.querySelector('[data-action="collapse-toggle"]');
+  if (collapse) {
+    const on = settings.autoCollapse !== false;
+    collapse.classList.toggle("is-on", on);
+    collapse.setAttribute("aria-pressed", String(on));
+    collapse.textContent = on ? "Expand skipped" : "Collapse skipped";
+    collapse.title = on
+      ? "Skipped diffs are auto-collapsed. Click to expand them."
+      : "Collapse skipped diffs and keep collapsing them as files load";
+  }
 }
 
 function updateBar(dimmed, focused) {
@@ -363,6 +481,7 @@ function updateBar(dimmed, focused) {
 function observe() {
   observer?.disconnect();
   observer = new MutationObserver((mutations) => {
+    if (syncingCollapse) return;
     if (location.href !== lastUrl) {
       lastUrl = location.href;
       document.getElementById("gco-bar")?.remove();

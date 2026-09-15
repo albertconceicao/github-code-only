@@ -41,6 +41,13 @@
           <small>.cursor, AGENTS.md, Copilot, *.generated.*, *.pb.go</small>
         </span>
       </label>
+      <label class="row">
+        <input type="checkbox" data-key="autoCollapse" />
+        <span>
+          <b>Auto-collapse skipped files</b>
+          <small>Fold their diffs on page load. Overlay button can expand them.</small>
+        </span>
+      </label>
 
       <label class="custom">
         Extra patterns (one per line, glob or /regex/)
@@ -49,7 +56,7 @@
 
       <footer>
         Open a PR on <code>/files</code> or <code>/changes</code>. Matched files stay
-        visible with a strikethrough and lower opacity.
+        visible, dimmed, struck through, and collapsed.
       </footer>
     </main>
     <script src="popup.js"></script>
