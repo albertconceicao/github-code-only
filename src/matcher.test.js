@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { classify, shouldHide, isReviewPage } = require("./matcher.js");
+const { classify, shouldHide, isReviewPage, fileNameTokens, textMatchesExclusivePath } = require("./matcher.js");
 
 function reasons(path) {
   const flags = classify(path);
@@ -72,6 +72,29 @@ test("supports custom globs and regex", () => {
   assert.equal(shouldHide("vendor/lodash/index.js", settings), "custom");
   assert.equal(shouldHide("yarn.lock", settings), "custom");
   assert.equal(shouldHide("src/app.ts", settings), null);
+});
+
+test("exclusive filename text does not leak to a sibling source file", () => {
+  assert.deepEqual(fileNameTokens("week-calendar.test.ts"), ["week-calendar.test.ts"]);
+  assert.deepEqual(fileNameTokens("week-calendar.test.ts\nweek-calendar.ts").sort(), [
+    "week-calendar.test.ts",
+    "week-calendar.ts",
+  ]);
+  assert.equal(
+    textMatchesExclusivePath("week-calendar.test.ts", "packages/domain/src/agenda/week-calendar.test.ts"),
+    true
+  );
+  assert.equal(
+    textMatchesExclusivePath(
+      "week-calendar.test.ts week-calendar.ts",
+      "packages/domain/src/agenda/week-calendar.test.ts"
+    ),
+    false
+  );
+  assert.equal(
+    textMatchesExclusivePath("week-calendar.ts", "packages/domain/src/agenda/week-calendar.test.ts"),
+    false
+  );
 });
 
 test("detects GitHub review URLs including the new /changes page", () => {

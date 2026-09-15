@@ -1,32 +1,26 @@
 .gco-dimmed {
-  opacity: 0.32 !important;
-  filter: grayscale(0.25);
+  opacity: 0.38 !important;
+  filter: grayscale(0.2);
   transition: opacity 0.15s ease;
 }
 
-.gco-dimmed .gco-dimmed {
-  opacity: 1 !important;
-  filter: none;
-}
-
 .gco-dimmed:hover {
-  opacity: 0.72 !important;
+  opacity: 0.78 !important;
   filter: none;
 }
 
-[data-tree-entry-type="file"].gco-dimmed,
-[role="treeitem"].gco-dimmed,
-.gco-dimmed .file-header a,
-.gco-dimmed .file-info a,
-.gco-dimmed [class*="DiffFileHeader-module__file-name"] {
-  text-decoration: line-through;
-  text-decoration-thickness: 1px;
-  text-decoration-color: currentColor;
+.gco-focus:not(.gco-dimmed) {
+  filter: none;
+  text-decoration: none;
 }
 
-.gco-focus[data-tree-entry-type="file"],
-.gco-focus[role="treeitem"]:not([aria-expanded]) {
-  font-weight: 600;
+.gco-strike {
+  text-decoration: line-through !important;
+  text-decoration-thickness: 1px;
+}
+
+.gco-focus.gco-strike {
+  text-decoration: none !important;
 }
 
 .gco-bar {

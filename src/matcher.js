@@ -121,6 +121,23 @@ function basename(filePath) {
   return parts[parts.length - 1] || "";
 }
 
+function fileNameTokens(text) {
+  return [
+    ...new Set(
+      String(text || "")
+        .match(/[A-Za-z0-9._-]+\.[A-Za-z0-9]{1,8}/g)
+        ?.map((name) => name.toLowerCase()) || []
+    ),
+  ];
+}
+
+function textMatchesExclusivePath(text, filePath) {
+  const base = basename(filePath).toLowerCase();
+  if (!base) return false;
+  const tokens = fileNameTokens(text);
+  return tokens.length === 1 && tokens[0] === base;
+}
+
 function extname(filePath) {
   const name = basename(filePath);
   const idx = name.lastIndexOf(".");
@@ -347,6 +364,9 @@ const GitHubCodeOnly = {
   shouldHide,
   matchesCustom,
   normalizePath,
+  basename,
+  fileNameTokens,
+  textMatchesExclusivePath,
   isReviewPage,
   isTestPath,
   isAdrPath,

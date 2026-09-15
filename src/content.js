@@ -1,9 +1,11 @@
 (() => {
-const { shouldHide, normalizePath, isReviewPage } = globalThis.GitHubCodeOnly;
+const { shouldHide, normalizePath, basename, fileNameTokens, textMatchesExclusivePath, isReviewPage } =
+  globalThis.GitHubCodeOnly;
 
 const STORAGE_KEY = "gco-settings";
 const DIMMED_CLASS = "gco-dimmed";
 const FOCUS_CLASS = "gco-focus";
+const STRIKE_CLASS = "gco-strike";
 const DEFAULT_SETTINGS = {
   tests: true,
   adrs: false,
@@ -93,34 +95,198 @@ function pathFromReactHeader(el) {
   return normalizePath(tokens[tokens.length - 1] || candidate.split(" ")[0] || "");
 }
 
+function isLayoutNode(el) {
+  if (!el || el.nodeType !== 1) return true;
+  const id = el.id || "";
+  if (id === "diff-layout-component" || id.startsWith("diff-layout") || id === "files") return true;
+  const cls = String(el.className || "");
+  if (/diff-sidebar|Layout-sidebar|diff-view|DiffList|file-tree/i.test(cls)) return true;
+  return false;
+}
+
+function isHeaderRoot(el) {
+  if (!el || el.nodeType !== 1) return false;
+  if (el.classList?.contains("file-header")) return true;
+  const cls = String(el.className || "");
+  return /DiffFileHeader-module__diff-file-header|Diff-module__diffHeaderWrapper/i.test(cls);
+}
+
+function headerRoots(el) {
+  if (!el || el.nodeType !== 1) return [];
+  const found = [];
+  if (isHeaderRoot(el)) found.push(el);
+  el.querySelectorAll(
+    ".file-header, [class*='DiffFileHeader-module__diff-file-header'], [class*='Diff-module__diffHeaderWrapper']"
+  ).forEach((node) => found.push(node));
+  return [...new Set(found)].filter((node) => !found.some((other) => other !== node && other.contains(node)));
+}
+
+function headerPath(el) {
+  return normalizePath(pathFromElement(el) || pathFromReactHeader(el));
+}
+
+function pathsMatch(left, right) {
+  if (!left || !right) return false;
+  const a = normalizePath(left);
+  const b = normalizePath(right);
+  return a === b || basename(a).toLowerCase() === basename(b).toLowerCase();
+}
+
+function ownLabelText(el) {
+  if (!el) return "";
+  const titled = `${el.getAttribute("title") || ""} ${el.getAttribute("aria-label") || ""}`.trim();
+  if (titled && fileNameTokens(titled).length === 1) return titled;
+
+  const clone = el.cloneNode(true);
+  clone
+    .querySelectorAll('[role="treeitem"], [role="group"], [data-tree-entry-type], [class*="DiffFileHeader"], .file-header')
+    .forEach((node) => {
+      if (node !== clone) node.remove();
+    });
+  return (clone.textContent || "").replace(/\s+/g, " ").trim();
+}
+
+function exclusiveLabel(el, path) {
+  if (!el || !path) return null;
+  const base = basename(path).toLowerCase();
+  const nodes = [el, ...el.querySelectorAll("a, span, [class*='file-name'], [class*='ItemLabel']")];
+  let best = null;
+  for (const node of nodes) {
+    if (node.id === "gco-bar" || node.closest?.("#gco-bar")) continue;
+    const text = `${node.getAttribute?.("title") || ""} ${node.getAttribute?.("aria-label") || ""} ${
+      node.textContent || ""
+    }`;
+    if (!textMatchesExclusivePath(text, path)) continue;
+    best = node;
+  }
+  if (best) return best;
+  for (const node of nodes) {
+    const text = (node.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+    if (text === base || text.endsWith(`/${base}`)) best = node;
+  }
+  return best;
+}
+
+function fileTitleNodes(el) {
+  if (!el?.querySelectorAll) return [];
+  return [
+    ...el.querySelectorAll(
+      '[class*="DiffFileHeader-module__file-name"], [class*="DiffFileHeader-module__fileName"], .file-header a.Link--primary'
+    ),
+  ];
+}
+
+function expandExclusiveCard(start) {
+  if (!start) return null;
+  let card = start;
+  let node = start.parentElement;
+  while (node && node !== document.body) {
+    if (isLayoutNode(node) || node.id === "diff-layout-component") break;
+    if (headerRoots(node).length > 1 || fileTitleNodes(node).length > 1) break;
+    card = node;
+    if (
+      node.matches?.(
+        "div.file.js-file, copilot-diff-entry, [data-details-container-group='file'], details, .js-details-container"
+      )
+    ) {
+      return node;
+    }
+    node = node.parentElement;
+  }
+  return card;
+}
+
+function fileSlice(header) {
+  const nodes = [header];
+  let sib = header.nextElementSibling;
+  while (sib) {
+    if (isHeaderRoot(sib) || headerRoots(sib).length > 0) break;
+    nodes.push(sib);
+    sib = sib.nextElementSibling;
+  }
+  return nodes;
+}
+
+function visualTargets(el, path) {
+  if (el.closest?.('[role="tree"]')) {
+    const treeRow = el.closest('[role="treeitem"], [data-tree-entry-type="file"]') || el;
+    const nested = [...treeRow.querySelectorAll('[role="treeitem"], [data-tree-entry-type="file"]')].filter(
+      (node) => node !== treeRow
+    );
+    if (treeRow.hasAttribute("aria-expanded") || nested.length > 0) {
+      const label = exclusiveLabel(treeRow, path);
+      return label ? [label] : [];
+    }
+    return [treeRow];
+  }
+
+  const header = findMatchingHeader(el, path);
+  const card = expandExclusiveCard(header || el);
+  if (card && headerRoots(card).length <= 1 && fileTitleNodes(card).length <= 1 && !isLayoutNode(card)) {
+    return [card];
+  }
+  if (header) return fileSlice(header);
+  return [el];
+}
+
+function findMatchingHeader(el, path) {
+  if (!el || !path) return null;
+  const roots = headerRoots(el);
+  const match = roots.find((header) => pathsMatch(headerPath(header), path));
+  if (match) return match;
+  if (isHeaderRoot(el) && pathsMatch(headerPath(el), path)) return el;
+  const closest = el.closest?.(
+    ".file-header, [class*='DiffFileHeader-module__diff-file-header'], [class*='Diff-module__diffHeaderWrapper']"
+  );
+  if (closest && pathsMatch(headerPath(closest), path)) return closest;
+  return null;
+}
+
+function fileUnitFrom(node) {
+  if (!node || node.nodeType !== 1 || isLayoutNode(node)) return null;
+
+  const exact = node.closest(
+    "div.file.js-file[data-tagsearch-path], copilot-diff-entry[data-file-path], [data-details-container-group='file']"
+  );
+  if (exact && headerRoots(exact).length <= 1) return exact;
+
+  const hashed = node.closest('div[id^="diff-"]');
+  if (hashed && /^diff-[a-f0-9]{16,}$/i.test(hashed.id) && headerRoots(hashed).length <= 1) return hashed;
+
+  const header =
+    node.closest('[class*="DiffFileHeader-module__diff-file-header"]') ||
+    node.closest('[class*="Diff-module__diffHeaderWrapper"]') ||
+    (node.classList?.contains("file-header") ? node : null);
+  if (header) return expandExclusiveCard(header) || header;
+  return expandExclusiveCard(node);
+}
+
+function clearMarks() {
+  document.querySelectorAll(`.${DIMMED_CLASS}, .${FOCUS_CLASS}, .${STRIKE_CLASS}`).forEach((el) => {
+    if (el.id === "gco-bar" || el.closest("#gco-bar")) return;
+    el.classList.remove(DIMMED_CLASS, FOCUS_CLASS, STRIKE_CLASS);
+    el.removeAttribute("data-gco-reason");
+  });
+}
+
 function collectDiffs() {
   const nodes = [
     ...document.querySelectorAll("copilot-diff-entry[data-file-path]"),
     ...document.querySelectorAll("div.file.js-file[data-tagsearch-path]"),
     ...document.querySelectorAll("div.file-header[data-path]"),
-    ...document.querySelectorAll("[data-file-path]"),
     ...document.querySelectorAll('[class*="DiffFileHeader-module__diff-file-header"]'),
     ...document.querySelectorAll('[class*="DiffFileHeader-module__file-name"]'),
     ...document.querySelectorAll('[class*="Diff-module__diffHeaderWrapper"]'),
-    ...document.querySelectorAll('div[id^="diff-"]'),
   ];
 
   const seen = new Set();
   const diffs = [];
   for (const node of nodes) {
-    if (node.id === "diff-layout-component") continue;
-    let path = normalizePath(pathFromElement(node));
-    if (!path) path = pathFromReactHeader(node);
-
-    let target = node;
-    if (node.classList.contains("file-header") || node.matches?.('[class*="DiffFileHeader-module"], [class*="Diff-module__diffHeader"]')) {
-      target =
-        node.closest("div.file.js-file, copilot-diff-entry, [data-details-container-group='file'], [id^='diff-']") ||
-        node.closest('[class*="Diff-module"]') ||
-        node;
-    }
-    if (target.id === "diff-layout-component") continue;
-    if (!path || seen.has(target)) continue;
+    const target = fileUnitFrom(node);
+    if (!target || seen.has(target)) continue;
+    let path = normalizePath(pathFromElement(target) || pathFromElement(node));
+    if (!path) path = pathFromReactHeader(target) || pathFromReactHeader(node);
+    if (!path) continue;
     seen.add(target);
     diffs.push({ path, el: target });
   }
@@ -129,42 +295,39 @@ function collectDiffs() {
 
 function directTreeLabel(el) {
   const titled = looksLikePath(el.getAttribute("title") || "") || looksLikePath(el.getAttribute("aria-label") || "");
-  if (titled) return titled;
+  if (titled && fileNameTokens(titled).length <= 1) return titled;
 
-  for (const child of el.children) {
-    const role = child.getAttribute("role");
-    if (role === "group" || role === "treeitem") continue;
-    if (child.querySelector?.('[role="treeitem"], [role="group"]')) continue;
-    const text = (child.textContent || "").replace(/\s+/g, " ").trim();
+  const own = ownLabelText(el);
+  const tokens = fileNameTokens(own);
+  if (tokens.length === 1) return tokens[0];
+  if (own && fileNameTokens(own).length <= 1) {
+    const text = own.replace(/\u200E/g, " ").replace(/\s+/g, " ").trim();
     if (text) return text.split(" ")[0];
   }
-
-  const first = (el.innerText || "")
-    .split("\n")
-    .map((line) => line.trim())
-    .find(Boolean);
-  return first ? first.split(" ")[0] : "";
+  return "";
 }
 
 function pathFromTreeItem(el) {
   const attr = pathFromElement(el);
-  if (attr.includes("/")) return attr;
+  if (attr.includes("/") && fileNameTokens(attr).length <= 1) return attr;
 
-  const label = directTreeLabel(el);
-  if (label.includes("/")) return label;
-
+  const ownName = directTreeLabel(el);
   const parts = [];
+  if (ownName && !ownName.includes("/")) parts.push(ownName);
+  else if (ownName.includes("/")) return ownName;
+
   const treeRoot = el.closest('[role="tree"]');
-  let node = el;
+  let node = el.parentElement;
   while (node && node !== treeRoot) {
     const isItem =
       node.getAttribute?.("role") === "treeitem" ||
-      node.getAttribute?.("data-tree-entry-type") === "file" ||
       node.getAttribute?.("data-tree-entry-type") === "directory";
     if (isItem) {
       const name = directTreeLabel(node);
-      if (name.includes("/")) return name;
-      if (name) parts.unshift(name);
+      const nameTokens = fileNameTokens(name);
+      if (name && nameTokens.length === 0 && !name.includes(".")) {
+        parts.unshift(name);
+      }
     }
     node = node.parentElement;
   }
@@ -179,41 +342,22 @@ function collectTreeFiles() {
   const items = [
     ...document.querySelectorAll("[data-tree-entry-type='file']"),
     ...document.querySelectorAll('[role="tree"] [role="treeitem"]'),
+    ...document.querySelectorAll('[role="tree"] a[href]'),
   ];
   const seen = new Set();
   const files = [];
   for (const el of items) {
     if (el.getAttribute("data-tree-entry-type") === "directory") continue;
+    if (el.hasAttribute("aria-expanded")) continue;
     if (el.querySelector('[role="treeitem"], [data-tree-entry-type="file"], [data-tree-entry-type="directory"]')) {
       continue;
     }
-    const path = normalizePath(pathFromTreeItem(el) || treePathFallback(el));
-    if (!path || seen.has(el)) continue;
+    const path = normalizePath(pathFromTreeItem(el) || treePathFallback(el) || looksLikePath(el.textContent || ""));
+    if (!path || !basename(path).includes(".") || seen.has(el)) continue;
     seen.add(el);
     files.push({ path, el });
   }
   return files;
-}
-
-function dimFullyFilteredDirectories() {
-  const dirs = [
-    ...document.querySelectorAll("[data-tree-entry-type='directory']"),
-    ...document.querySelectorAll('[role="tree"] [role="treeitem"][aria-expanded]'),
-  ];
-  dirs.sort((a, b) => (b.querySelectorAll("[role='treeitem']").length || 0) - (a.querySelectorAll("[role='treeitem']").length || 0));
-  for (const dir of dirs) {
-    const files = [
-      ...dir.querySelectorAll("[data-tree-entry-type='file']"),
-      ...[...dir.querySelectorAll('[role="treeitem"]')].filter(
-        (item) => item !== dir && !item.hasAttribute("aria-expanded") && !item.querySelector('[role="treeitem"]')
-      ),
-    ];
-    const unique = [...new Set(files)];
-    const focused = unique.filter((file) => !file.classList.contains(DIMMED_CLASS));
-    const allDimmed = unique.length > 0 && focused.length === 0;
-    dir.classList.toggle(DIMMED_CLASS, allDimmed);
-    dir.classList.toggle(FOCUS_CLASS, !allDimmed && unique.length > 0);
-  }
 }
 
 function isCollapseControl(btn) {
@@ -233,16 +377,8 @@ function isCollapseControl(btn) {
   return true;
 }
 
-function diffHeader(container) {
-  return (
-    container.querySelector(
-      ".file-header, [class*='DiffFileHeader'], [class*='Diff-module__diffHeader']"
-    ) || container
-  );
-}
-
-function findCollapseButton(container, collapsed) {
-  const scope = diffHeader(container);
+function findCollapseButton(header, collapsed) {
+  const scope = header || document;
   const buttons = [...scope.querySelectorAll("button")].filter(isCollapseControl);
 
   for (const btn of buttons) {
@@ -264,31 +400,31 @@ function findCollapseButton(container, collapsed) {
   return null;
 }
 
-function setDiffCollapsed(fileEl, collapsed) {
-  const container =
-    fileEl.closest("div.file.js-file, copilot-diff-entry, [data-details-container-group='file'], [id^='diff-']") ||
-    fileEl.closest('[class*="Diff-module"]') ||
-    fileEl;
-  if (!container || container.id === "diff-layout-component") return false;
+function setDiffCollapsed(fileEl, collapsed, path) {
+  const header = findMatchingHeader(fileEl, path) || fileEl;
+  if (!header || header.id === "diff-layout-component") return false;
+  const card = expandExclusiveCard(header);
 
-  const details = container.matches("details") ? container : container.querySelector(":scope > details");
-  if (details && typeof details.open === "boolean") {
-    if (details.open === !collapsed) return false;
-    details.open = !collapsed;
-    return true;
+  if (card && headerRoots(card).length <= 1) {
+    const details = card.matches("details") ? card : card.querySelector(":scope > details");
+    if (details && typeof details.open === "boolean") {
+      if (details.open === !collapsed) return false;
+      details.open = !collapsed;
+      return true;
+    }
+
+    if (card.classList.contains("js-details-container") || card.classList.contains("Details")) {
+      const isOpen = card.classList.contains("open") || card.classList.contains("Details--on");
+      if (isOpen === !collapsed) return false;
+      card.classList.toggle("open", !collapsed);
+      card.classList.toggle("Details--on", !collapsed);
+      const toggle = card.querySelector(".file-header [aria-expanded], button[aria-label='Toggle diff contents']");
+      if (toggle) toggle.setAttribute("aria-expanded", String(!collapsed));
+      return true;
+    }
   }
 
-  if (container.classList.contains("js-details-container") || container.classList.contains("Details")) {
-    const isOpen = container.classList.contains("open") || container.classList.contains("Details--on");
-    if (isOpen === !collapsed) return false;
-    container.classList.toggle("open", !collapsed);
-    container.classList.toggle("Details--on", !collapsed);
-    const btn = container.querySelector(".file-header [aria-expanded], button[aria-label='Toggle diff contents']");
-    if (btn) btn.setAttribute("aria-expanded", String(!collapsed));
-    return true;
-  }
-
-  const btn = findCollapseButton(container, collapsed);
+  const btn = findCollapseButton(header, collapsed) || (card && card !== header ? findCollapseButton(card, collapsed) : null);
   if (!btn) return false;
   btn.click();
   return true;
@@ -299,8 +435,8 @@ function collapseSkippedDiffs(collapsed) {
   observer?.disconnect();
   try {
     for (const item of collectDiffs()) {
-      if (!item.el.classList.contains(DIMMED_CLASS)) continue;
-      setDiffCollapsed(item.el, collapsed);
+      if (!shouldHide(item.path, settings)) continue;
+      setDiffCollapsed(item.el, collapsed, item.path);
     }
   } finally {
     window.setTimeout(() => {
@@ -317,6 +453,7 @@ function applyFilters() {
   }
 
   ensureBar();
+  clearMarks();
 
   const diffs = collectDiffs();
   const treeFiles = collectTreeFiles();
@@ -326,25 +463,32 @@ function applyFilters() {
     if (!item.path) return;
     uniquePaths.add(item.path);
     const reason = shouldHide(item.path, settings);
-    item.el.classList.toggle(DIMMED_CLASS, Boolean(reason));
-    item.el.classList.toggle(FOCUS_CLASS, !reason);
-    if (reason) item.el.setAttribute("data-gco-reason", reason);
-    else item.el.removeAttribute("data-gco-reason");
+    const targets = visualTargets(item.el, item.path);
+    for (const target of targets) {
+      if (!target || target.id === "gco-bar" || target.closest("#gco-bar")) continue;
+      target.classList.toggle(DIMMED_CLASS, Boolean(reason));
+      target.classList.toggle(FOCUS_CLASS, !reason);
+      if (reason) target.setAttribute("data-gco-reason", reason);
+      else target.removeAttribute("data-gco-reason");
+    }
+    const label = exclusiveLabel(item.el, item.path);
+    if (label && label !== item.el) {
+      label.classList.toggle(STRIKE_CLASS, Boolean(reason));
+    } else if (reason && targets[0]) {
+      targets[0].classList.add(STRIKE_CLASS);
+    }
   };
 
   diffs.forEach(applyTo);
   treeFiles.forEach(applyTo);
 
   const dimmedPaths = new Set(
-    [...diffs, ...treeFiles]
-      .filter((item) => item.el.classList.contains(DIMMED_CLASS))
-      .map((item) => item.path)
+    [...diffs, ...treeFiles].filter((item) => shouldHide(item.path, settings)).map((item) => item.path)
   );
   const dimmedCount = dimmedPaths.size;
   const total = uniquePaths.size || dimmedCount;
   const focused = Math.max(total - dimmedCount, 0);
 
-  dimFullyFilteredDirectories();
   updateBar(dimmedCount, focused);
   if (settings.autoCollapse !== false && !syncingCollapse) {
     collapseSkippedDiffs(true);
