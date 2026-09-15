@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GitHub Code Only</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <strong>Code Only</strong>
+        <p>Dim noise on Files changed so review stays on real code.</p>
+      </header>
+
+      <label class="row">
+        <input type="checkbox" data-key="tests" />
+        <span>
+          <b>Tests</b>
+          <small>*.test.*, *.spec.ts, __tests__, e2e, cypress…</small>
+        </span>
+      </label>
+      <label class="row">
+        <input type="checkbox" data-key="adrs" />
+        <span>
+          <b>ADRs</b>
+          <small>docs/adr, decisions, adr-*.md</small>
+        </span>
+      </label>
+      <label class="row">
+        <input type="checkbox" data-key="specs" />
+        <span>
+          <b>Specs</b>
+          <small>SPEC.md, docs/specs, .specify — does not dim *.spec.ts tests</small>
+        </span>
+      </label>
+      <label class="row">
+        <input type="checkbox" data-key="ai" />
+        <span>
+          <b>AI files</b>
+          <small>.cursor, AGENTS.md, Copilot, *.generated.*, *.pb.go</small>
+        </span>
+      </label>
+
+      <label class="custom">
+        Extra patterns (one per line, glob or /regex/)
+        <textarea id="custom" rows="4" placeholder="vendor/**&#10;*.lock&#10;/storybook/"></textarea>
+      </label>
+
+      <footer>
+        Open a PR on <code>/files</code> or <code>/changes</code>. Matched files stay
+        visible with a strikethrough and lower opacity.
+      </footer>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

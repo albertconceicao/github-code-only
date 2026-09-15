@@ -1,0 +1,9 @@
+{
+  "name": "github-code-only",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Dim tests, ADRs, specs, and AI files on GitHub PR review",
+  "scripts": {
+    "test": "node --test src/matcher.test.js"
+  }
+}

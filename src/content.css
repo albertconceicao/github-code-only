@@ -1,0 +1,103 @@
+.gco-dimmed {
+  opacity: 0.32 !important;
+  filter: grayscale(0.25);
+  transition: opacity 0.15s ease;
+}
+
+.gco-dimmed .gco-dimmed {
+  opacity: 1 !important;
+  filter: none;
+}
+
+.gco-dimmed:hover {
+  opacity: 0.72 !important;
+  filter: none;
+}
+
+[data-tree-entry-type="file"].gco-dimmed,
+[role="treeitem"].gco-dimmed,
+.gco-dimmed .file-header a,
+.gco-dimmed .file-info a,
+.gco-dimmed [class*="DiffFileHeader-module__file-name"] {
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+  text-decoration-color: currentColor;
+}
+
+.gco-focus[data-tree-entry-type="file"],
+.gco-focus[role="treeitem"]:not([aria-expanded]) {
+  font-weight: 600;
+}
+
+.gco-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  font-family: var(--fontStack-sansSerif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.gco-bar--floating {
+  position: fixed;
+  top: 88px;
+  right: 16px;
+  z-index: 9999;
+  margin: 0;
+  max-width: min(360px, calc(100vw - 32px));
+  padding: 8px 10px;
+  border: 1px solid var(--borderColor-default, #d0d7de);
+  border-radius: 10px;
+  background: var(--bgColor-default, #fff);
+  box-shadow: var(--shadow-floating-small, 0 8px 24px rgba(0, 0, 0, 0.24));
+}
+
+.gco-brand {
+  font-weight: 650;
+  color: var(--fgColor-muted, #656d76);
+  margin-right: 2px;
+  letter-spacing: 0.01em;
+}
+
+.gco-chip {
+  appearance: none;
+  border: 1px solid var(--borderColor-default, #d0d7de);
+  background: var(--bgColor-muted, #f6f8fa);
+  color: var(--fgColor-default, #1f2328);
+  border-radius: 999px;
+  padding: 3px 9px;
+  font: inherit;
+  font-weight: 575;
+  cursor: pointer;
+}
+
+.gco-chip:hover {
+  background: var(--bgColor-neutral-muted, rgba(175, 184, 193, 0.2));
+}
+
+.gco-chip.is-on {
+  border-color: var(--borderColor-accent-emphasis, #0969da);
+  background: var(--bgColor-accent-muted, #ddf4ff);
+  color: var(--fgColor-accent, #0969da);
+}
+
+.gco-chip-all.is-on {
+  border-color: var(--borderColor-success-emphasis, #1a7f37);
+  background: var(--bgColor-success-muted, #dafbe1);
+  color: var(--fgColor-success, #1a7f37);
+}
+
+.gco-count {
+  color: var(--fgColor-muted, #656d76);
+  margin-left: 4px;
+  white-space: nowrap;
+}
+
+@media (max-width: 767px) {
+  .gco-bar:not(.gco-bar--floating) {
+    width: 100%;
+    margin: 8px 0 0;
+  }
+}
